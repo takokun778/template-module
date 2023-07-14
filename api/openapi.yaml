@@ -1,0 +1,105 @@
+openapi: 3.0.3
+info:
+  title: OpenAPI
+  description: |-
+    This is the OpenAPI documentation.
+  termsOfService: https://example.com
+  contact:
+    email: openapi@example.com
+  license:
+    name: MIT
+  version: 0.0.1
+externalDocs:
+  description: Find out more about Swagger
+  url: http://swagger.io
+servers:
+  - url: http://localhost:8080/api
+tags:
+  - name: health
+    description: Health check
+paths:
+  /v1/health/api:
+    get:
+      tags:
+        - health
+      summary: APIのヘルスチェック
+      description: ヘルスチェック
+      operationId: v1HealthAPI
+      responses:
+        '200':
+          description: OK
+        '500':
+          description: Internal Server Error
+  /v1/health/db:
+    get:
+      tags:
+        - health
+      summary: データベースのヘルスチェック
+      description: ヘルスチェック
+      operationId: v1HealthDB
+      responses:
+        '200':
+          description: OK
+        '500':
+          description: Internal Server Error
+  /v1/health/cache:
+    get:
+      tags:
+        - health
+      summary: キャッシュのヘルスチェック
+      description: ヘルスチェック
+      operationId: v1HealthCache
+      responses:
+        '200':
+          description: OK
+        '500':
+          description: Internal Server Error
+  /v1/hello:
+    post:
+      tags:
+        - health
+      summary: Hello
+      description: Hello
+      operationId: v1Hello
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        description: Helloリクエストボディ
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/V1HelloRequestSchema'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1HelloResponseSchema'
+        '500':
+          description: Internal Server Error
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      name: api-key
+      in: header
+  schemas:
+    V1HelloRequestSchema:
+      type: object
+      properties:
+        name:
+          type: string
+          description: name
+      required:
+        - name
+    V1HelloResponseSchema:
+      type: object
+      properties:
+        greet:
+          type: string
+          description: 挨拶
+          example: hello user
+      required:
+        - greet

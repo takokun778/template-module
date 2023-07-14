@@ -1,0 +1,20 @@
+name: yaml lint
+run-name: ${{ github.ref_name }} by @${{ github.actor }} ${{ github.workflow }}
+on:
+  pull_request:
+    paths:
+      - "**/*.yaml"
+jobs:
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: go.mod
+      - name: Set up yamlfmt
+        run: go install github.com/google/yamlfmt/cmd/yamlfmt@v0.7.1
+      - name: Yaml format lint
+        run: yamlfmt -lint
