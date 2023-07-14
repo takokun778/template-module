@@ -28,7 +28,7 @@ jobs:
       - name: Go test e2e
         env:
           E2E_ENDPOINT: http://localhost:8080
-        run: go test ./e2e/... -tags e2e
+        run: go test ./test/e2e/... -tags e2e
       - name: Shutdown
         if: always()
         run: kill ${{ steps.run-app.outputs.pid }}
