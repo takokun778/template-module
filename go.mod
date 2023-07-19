@@ -6,7 +6,7 @@ require (
 	github.com/bufbuild/connect-go v1.9.0
 	github.com/go-chi/chi/v5 v5.0.10
 	github.com/go-chi/cors v1.2.1
-	github.com/go-chi/httplog v0.3.0
+	github.com/go-chi/httplog v0.3.1
 	github.com/google/uuid v1.3.0
 	github.com/jackc/pgx/v5 v5.4.2
 	github.com/redis/rueidis v1.0.12
