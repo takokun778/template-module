@@ -1,4 +1,4 @@
-# github.com/bufbuild/connect-go v1.9.0
+# github.com/bufbuild/connect-go v1.10.0
 ## explicit; go 1.19
 github.com/bufbuild/connect-go
 github.com/bufbuild/connect-go/internal/gen/connectext/grpc/status/v1
