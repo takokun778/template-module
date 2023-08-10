@@ -8,7 +8,7 @@ require (
 	github.com/go-chi/cors v1.2.1
 	github.com/go-chi/httplog v0.3.0
 	github.com/google/uuid v1.3.0
-	github.com/jackc/pgx/v5 v5.4.2
+	github.com/jackc/pgx/v5 v5.4.3
 	github.com/redis/rueidis v1.0.12
 	go.uber.org/zap v1.24.0
 	google.golang.org/protobuf v1.31.0
