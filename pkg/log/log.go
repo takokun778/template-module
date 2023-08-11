@@ -7,13 +7,19 @@ import (
 )
 
 func Log() *slog.Logger {
-	return slog.New(slog.NewJSONHandler(os.Stdout, nil))
-}
+	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
 
-func ErrorAttr(err error) slog.Attr {
-	return slog.String("error", err.Error())
+	if debug {
+		opts.Level = slog.LevelDebug
+	}
+
+	return slog.New(slog.NewJSONHandler(os.Stdout, opts))
 }
 
 func MsgAttr(msg string, args ...interface{}) string {
 	return fmt.Sprintf(msg, args...)
+}
+
+func ErrorAttr(err error) slog.Attr {
+	return slog.String("error", err.Error())
 }

@@ -15,12 +15,21 @@ import (
 	"github.com/go-chi/httplog"
 	"github.com/takokun778/template-module/internal/cache"
 	"github.com/takokun778/template-module/internal/database"
+	"github.com/takokun778/template-module/internal/env"
 	"github.com/takokun778/template-module/internal/handler"
 	"github.com/takokun778/template-module/pkg/log"
 	"github.com/takokun778/template-module/pkg/openapi"
 )
 
 func main() {
+	env.Init()
+
+	if env.Get().IsLocal() {
+		log.SetDebug()
+	}
+
+	log.Log().Debug(log.MsgAttr("debug mode"))
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"

@@ -11,9 +11,15 @@ import (
 type key struct{}
 
 func SetLogCtx(ctx context.Context) context.Context {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
 
-	return context.WithValue(ctx, key{}, logger.With("tie", uuid.NewString()))
+	if debug {
+		opts.Level = slog.LevelDebug
+	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, opts))
+
+	return context.WithValue(ctx, key{}, logger.With("tid", uuid.NewString()))
 }
 
 func GetLogCtx(ctx context.Context) *slog.Logger {
@@ -22,7 +28,7 @@ func GetLogCtx(ctx context.Context) *slog.Logger {
 	log, ok := v.(*slog.Logger)
 
 	if !ok {
-		return slog.New(slog.NewJSONHandler(os.Stdout, nil))
+		return Log()
 	}
 
 	return log
