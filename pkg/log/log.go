@@ -1,13 +1,19 @@
 package log
 
-import "go.uber.org/zap"
+import (
+	"fmt"
+	"log/slog"
+	"os"
+)
 
-func Log() *zap.Logger {
-	logger, _ := zap.NewProduction()
-
-	return logger
+func Log() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stdout, nil))
 }
 
-func ErrorField(err error) zap.Field {
-	return zap.String("error", err.Error())
+func ErrorAttr(err error) slog.Attr {
+	return slog.String("error", err.Error())
+}
+
+func MsgAttr(msg string, args ...interface{}) string {
+	return fmt.Sprintf(msg, args...)
 }

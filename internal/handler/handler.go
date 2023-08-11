@@ -64,4 +64,5 @@ func (hdl *Handler) V1Hello(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
+	w.Write([]byte("Hello"))
 }

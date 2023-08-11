@@ -19,7 +19,10 @@ import (
 	"github.com/redis/rueidis/internal/util"
 )
 
-var noHello = regexp.MustCompile("unknown command .?HELLO.?")
+const LIB_NAME = "rueidis"
+const LIB_VER = "1.0.14"
+
+var noHello = regexp.MustCompile("unknown command .?(HELLO|hello).?")
 
 type wire interface {
 	Do(ctx context.Context, cmd Completed) RedisResult
@@ -158,19 +161,11 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 		helloCmd = append(helloCmd, "SETNAME", option.ClientName)
 	}
 
-	init := make([][]string, 0, 3)
+	init := make([][]string, 0, 4)
 	if option.ClientTrackingOptions == nil {
 		init = append(init, helloCmd, []string{"CLIENT", "TRACKING", "ON", "OPTIN"})
 	} else {
 		init = append(init, helloCmd, append([]string{"CLIENT", "TRACKING", "ON"}, option.ClientTrackingOptions...))
-	}
-	if option.ClientNoEvict {
-		init = append(init, []string{"CLIENT", "NO-EVICT", "ON"})
-	}
-	if option.ClientSetInfo != nil {
-		clientSetInfoCmd := []string{"CLIENT", "SETINFO"}
-		clientSetInfoCmd = append(clientSetInfoCmd, option.ClientSetInfo...)
-		init = append(init, clientSetInfoCmd)
 	}
 	if option.DisableCache {
 		init = init[:1]
@@ -180,6 +175,14 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 	}
 	if option.ClientNoTouch {
 		init = append(init, []string{"CLIENT", "NO-TOUCH", "ON"})
+	}
+	if option.ClientNoEvict {
+		init = append(init, []string{"CLIENT", "NO-EVICT", "ON"})
+	}
+	if option.ClientSetInfo != nil {
+		init = append(init, append([]string{"CLIENT", "SETINFO"}, option.ClientSetInfo...))
+	} else {
+		init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", LIB_NAME, "LIB-VER", LIB_VER})
 	}
 
 	timeout := option.Dialer.Timeout
@@ -194,7 +197,7 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 	if !r2 && !r2ps {
 		resp := p.DoMulti(ctx, cmds.NewMultiCompleted(init)...)
 		defer resultsp.Put(resp)
-		for i, r := range resp.s {
+		for i, r := range resp.s[:len(resp.s)-1] { // skip error checking on the last CLIENT SETINFO
 			if i == 0 {
 				p.info, err = r.AsMap()
 			} else {
@@ -241,32 +244,31 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 		if option.ClientName != "" {
 			init = append(init, []string{"CLIENT", "SETNAME", option.ClientName})
 		}
-		if option.ClientNoEvict {
-			init = append(init, []string{"CLIENT", "NO-EVICT", "ON"})
-		}
-		if option.ClientSetInfo != nil {
-			clientSetInfoCmd := []string{"CLIENT", "SETINFO"}
-			clientSetInfoCmd = append(clientSetInfoCmd, option.ClientSetInfo...)
-			init = append(init, clientSetInfoCmd)
-		}
 		if option.SelectDB != 0 {
 			init = append(init, []string{"SELECT", strconv.Itoa(option.SelectDB)})
 		}
 		if option.ClientNoTouch {
 			init = append(init, []string{"CLIENT", "NO-TOUCH", "ON"})
 		}
-
+		if option.ClientNoEvict {
+			init = append(init, []string{"CLIENT", "NO-EVICT", "ON"})
+		}
+		if option.ClientSetInfo != nil {
+			init = append(init, append([]string{"CLIENT", "SETINFO"}, option.ClientSetInfo...))
+		} else {
+			init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", LIB_NAME, "LIB-VER", LIB_VER})
+		}
+		p.version = 5
 		if len(init) != 0 {
 			resp := p.DoMulti(ctx, cmds.NewMultiCompleted(init)...)
 			defer resultsp.Put(resp)
-			for _, r := range resp.s {
+			for _, r := range resp.s[:len(resp.s)-1] { // skip error checking on the last CLIENT SETINFO
 				if err = r.Error(); err != nil {
 					p.Close()
 					return nil, err
 				}
 			}
 		}
-		p.version = 5
 	}
 	if p.onInvalidations != nil || option.AlwaysPipelining {
 		p.background()
@@ -918,7 +920,6 @@ func (p *pipe) DoMulti(ctx context.Context, multi ...Completed) *redisresults {
 
 queue:
 	ch := p.queue.PutMulti(multi, resp.s)
-	var i int
 	if ctxCh := ctx.Done(); ctxCh == nil {
 		<-ch
 	} else {
@@ -932,15 +933,15 @@ queue:
 	atomic.AddInt32(&p.recvs, 1)
 	return resp
 abort:
-	go func(i int, resp *redisresults) {
+	go func(resp *redisresults) {
 		<-ch
 		resultsp.Put(resp)
 		atomic.AddInt32(&p.waits, -1)
 		atomic.AddInt32(&p.recvs, 1)
-	}(i, resp)
+	}(resp)
 	resp = resultsp.Get(len(multi), len(multi))
 	err := newErrResult(ctx.Err())
-	for ; i < len(resp.s); i++ {
+	for i := 0; i < len(resp.s); i++ {
 		resp.s[i] = err
 	}
 	return resp

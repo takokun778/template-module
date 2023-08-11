@@ -2,32 +2,27 @@ package log
 
 import (
 	"context"
+	"log/slog"
+	"os"
 
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 type key struct{}
 
 func SetLogCtx(ctx context.Context) context.Context {
-	logger, _ := zap.NewProduction()
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	tid := uuid.NewString()
-
-	log := logger.With(zap.String("tid", tid))
-
-	return context.WithValue(ctx, key{}, log)
+	return context.WithValue(ctx, key{}, logger.With("tie", uuid.NewString()))
 }
 
-func GetLogCtx(ctx context.Context) *zap.Logger {
+func GetLogCtx(ctx context.Context) *slog.Logger {
 	v := ctx.Value(key{})
 
-	log, ok := v.(*zap.Logger)
+	log, ok := v.(*slog.Logger)
 
 	if !ok {
-		logger, _ := zap.NewProduction()
-
-		return logger
+		return slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	}
 
 	return log

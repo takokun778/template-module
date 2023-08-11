@@ -1,4 +1,4 @@
-# github.com/bufbuild/connect-go v1.9.0
+# github.com/bufbuild/connect-go v1.10.0
 ## explicit; go 1.19
 github.com/bufbuild/connect-go
 github.com/bufbuild/connect-go/internal/gen/connectext/grpc/status/v1
@@ -9,7 +9,7 @@ github.com/go-chi/chi/v5/middleware
 # github.com/go-chi/cors v1.2.1
 ## explicit; go 1.14
 github.com/go-chi/cors
-# github.com/go-chi/httplog v0.3.0
+# github.com/go-chi/httplog v0.3.1
 ## explicit; go 1.14
 github.com/go-chi/httplog
 # github.com/google/uuid v1.3.0
@@ -21,7 +21,7 @@ github.com/jackc/pgpassfile
 # github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a
 ## explicit; go 1.14
 github.com/jackc/pgservicefile
-# github.com/jackc/pgx/v5 v5.4.2
+# github.com/jackc/pgx/v5 v5.4.3
 ## explicit; go 1.19
 github.com/jackc/pgx/v5
 github.com/jackc/pgx/v5/internal/anynil
@@ -41,39 +41,24 @@ github.com/mattn/go-colorable
 # github.com/mattn/go-isatty v0.0.19
 ## explicit; go 1.15
 github.com/mattn/go-isatty
-# github.com/redis/rueidis v1.0.12
+# github.com/redis/rueidis v1.0.14
 ## explicit; go 1.20
 github.com/redis/rueidis
 github.com/redis/rueidis/internal/cmds
 github.com/redis/rueidis/internal/util
-# github.com/rs/zerolog v1.29.1
+# github.com/rs/zerolog v1.30.0
 ## explicit; go 1.15
 github.com/rs/zerolog
 github.com/rs/zerolog/internal/cbor
 github.com/rs/zerolog/internal/json
 github.com/rs/zerolog/log
-# go.uber.org/atomic v1.11.0
-## explicit; go 1.18
-go.uber.org/atomic
-# go.uber.org/multierr v1.11.0
-## explicit; go 1.19
-go.uber.org/multierr
-# go.uber.org/zap v1.24.0
-## explicit; go 1.19
-go.uber.org/zap
-go.uber.org/zap/buffer
-go.uber.org/zap/internal
-go.uber.org/zap/internal/bufferpool
-go.uber.org/zap/internal/color
-go.uber.org/zap/internal/exit
-go.uber.org/zap/zapcore
-# golang.org/x/crypto v0.11.0
+# golang.org/x/crypto v0.12.0
 ## explicit; go 1.17
 golang.org/x/crypto/pbkdf2
-# golang.org/x/sys v0.10.0
+# golang.org/x/sys v0.11.0
 ## explicit; go 1.17
 golang.org/x/sys/unix
-# golang.org/x/text v0.11.0
+# golang.org/x/text v0.12.0
 ## explicit; go 1.17
 golang.org/x/text/cases
 golang.org/x/text/internal

@@ -91,11 +91,11 @@ func NewServer(
 }
 
 func (srv *Server) Run() {
-	log.Log().Sugar().Infof("server running on %s", srv.Addr)
+	log.Log().Info(log.MsgAttr("server started on port %s", srv.Addr))
 
 	go func() {
 		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			log.Log().Sugar().Errorf("server closed with error: %s", err.Error())
+			log.Log().Error("server closed with error", log.ErrorAttr(err))
 
 			os.Exit(1)
 		}
@@ -105,14 +105,14 @@ func (srv *Server) Run() {
 
 	signal.Notify(quit, syscall.SIGTERM, os.Interrupt)
 
-	log.Log().Sugar().Infof("SIGNAL %d received, then shutting down...\n", <-quit)
+	log.Log().Info(log.MsgAttr("SIGNAL %d received, then shutting down...\n", <-quit))
 
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTime*time.Second)
 
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Log().Sugar().Infof("failed to gracefully shutdown:", err)
+		log.Log().Info("failed to gracefully shutdown.", log.ErrorAttr(err))
 	}
 
 	log.Log().Info("server shutdown")
