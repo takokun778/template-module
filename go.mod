@@ -1,6 +1,6 @@
 module github.com/takokun778/template-module
 
-go 1.20
+go 1.21
 
 require (
 	github.com/bufbuild/connect-go v1.9.0
