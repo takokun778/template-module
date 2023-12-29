@@ -19,8 +19,8 @@ import (
 	"github.com/redis/rueidis/internal/util"
 )
 
-const LIB_NAME = "rueidis"
-const LIB_VER = "1.0.14"
+const LibName = "rueidis"
+const LibVer = "1.0.26"
 
 var noHello = regexp.MustCompile("unknown command .?(HELLO|hello).?")
 
@@ -31,6 +31,7 @@ type wire interface {
 	DoMultiCache(ctx context.Context, multi ...CacheableTTL) *redisresults
 	Receive(ctx context.Context, subscribe Completed, fn func(message PubSubMessage)) error
 	Info() map[string]RedisMessage
+	Version() int
 	Error() error
 	Close()
 
@@ -82,19 +83,19 @@ var _ wire = (*pipe)(nil)
 type pipe struct {
 	conn            net.Conn
 	error           atomic.Value
-	clhks           atomic.Value
-	pshks           atomic.Value
+	clhks           atomic.Value // closed hook, invoked after the conn is closed
+	pshks           atomic.Value // pubsub hook, registered by the SetPubSubHooks
 	queue           queue
 	cache           CacheStore
 	r               *bufio.Reader
 	w               *bufio.Writer
 	close           chan struct{}
 	onInvalidations func([]RedisMessage)
-	r2psFn          func() (p *pipe, err error)
-	r2pipe          *pipe
-	ssubs           *subs
-	nsubs           *subs
-	psubs           *subs
+	r2psFn          func() (p *pipe, err error) // func to build pipe for resp2 pubsub
+	r2pipe          *pipe                       // internal pipe for resp2 pubsub only
+	ssubs           *subs                       // pubsub smessage subscriptions
+	nsubs           *subs                       // pubsub  message subscriptions
+	psubs           *subs                       // pubsub pmessage subscriptions
 	info            map[string]RedisMessage
 	timeout         time.Duration
 	pinggap         time.Duration
@@ -107,7 +108,7 @@ type pipe struct {
 	state           int32
 	waits           int32
 	recvs           int32
-	r2ps            bool
+	r2ps            bool // identify this pipe is used for resp2 pubsub or not
 }
 
 func newPipe(connFn func() (net.Conn, error), option *ClientOption) (p *pipe, err error) {
@@ -151,17 +152,32 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 	p.pshks.Store(emptypshks)
 	p.clhks.Store(emptyclhks)
 
+	username := option.Username
+	password := option.Password
+	if option.AuthCredentialsFn != nil {
+		authCredentialsContext := AuthCredentialsContext{
+			Address: conn.RemoteAddr(),
+		}
+		authCredentials, err := option.AuthCredentialsFn(authCredentialsContext)
+		if err != nil {
+			p.Close()
+			return nil, err
+		}
+		username = authCredentials.Username
+		password = authCredentials.Password
+	}
+
 	helloCmd := []string{"HELLO", "3"}
-	if option.Password != "" && option.Username == "" {
-		helloCmd = append(helloCmd, "AUTH", "default", option.Password)
-	} else if option.Username != "" {
-		helloCmd = append(helloCmd, "AUTH", option.Username, option.Password)
+	if password != "" && username == "" {
+		helloCmd = append(helloCmd, "AUTH", "default", password)
+	} else if username != "" {
+		helloCmd = append(helloCmd, "AUTH", username, password)
 	}
 	if option.ClientName != "" {
 		helloCmd = append(helloCmd, "SETNAME", option.ClientName)
 	}
 
-	init := make([][]string, 0, 4)
+	init := make([][]string, 0, 5)
 	if option.ClientTrackingOptions == nil {
 		init = append(init, helloCmd, []string{"CLIENT", "TRACKING", "ON", "OPTIN"})
 	} else {
@@ -173,16 +189,19 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 	if option.SelectDB != 0 {
 		init = append(init, []string{"SELECT", strconv.Itoa(option.SelectDB)})
 	}
+	if option.ReplicaOnly && option.Sentinel.MasterSet == "" {
+		init = append(init, []string{"READONLY"})
+	}
 	if option.ClientNoTouch {
 		init = append(init, []string{"CLIENT", "NO-TOUCH", "ON"})
 	}
 	if option.ClientNoEvict {
 		init = append(init, []string{"CLIENT", "NO-EVICT", "ON"})
 	}
-	if option.ClientSetInfo != nil {
-		init = append(init, append([]string{"CLIENT", "SETINFO"}, option.ClientSetInfo...))
+	if len(option.ClientSetInfo) == 2 {
+		init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", option.ClientSetInfo[0]}, []string{"CLIENT", "SETINFO", "LIB-VER", option.ClientSetInfo[1]})
 	} else {
-		init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", LIB_NAME, "LIB-VER", LIB_VER})
+		init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", LibName}, []string{"CLIENT", "SETINFO", "LIB-VER", LibVer})
 	}
 
 	timeout := option.Dialer.Timeout
@@ -197,13 +216,17 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 	if !r2 && !r2ps {
 		resp := p.DoMulti(ctx, cmds.NewMultiCompleted(init)...)
 		defer resultsp.Put(resp)
-		for i, r := range resp.s[:len(resp.s)-1] { // skip error checking on the last CLIENT SETINFO
+		for i, r := range resp.s[:len(resp.s)-2] { // skip error checking on the last CLIENT SETINFO
 			if i == 0 {
 				p.info, err = r.AsMap()
 			} else {
 				err = r.Error()
 			}
 			if err != nil {
+				if init[i][0] == "READONLY" {
+					// ignore READONLY command error
+					continue
+				}
 				if re, ok := err.(*RedisError); ok {
 					if !r2 && noHello.MatchString(re.string) {
 						r2 = true
@@ -236,10 +259,10 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 			return nil, ErrNoCache
 		}
 		init = init[:0]
-		if option.Password != "" && option.Username == "" {
-			init = append(init, []string{"AUTH", option.Password})
-		} else if option.Username != "" {
-			init = append(init, []string{"AUTH", option.Username, option.Password})
+		if password != "" && username == "" {
+			init = append(init, []string{"AUTH", password})
+		} else if username != "" {
+			init = append(init, []string{"AUTH", username, password})
 		}
 		if option.ClientName != "" {
 			init = append(init, []string{"CLIENT", "SETNAME", option.ClientName})
@@ -247,22 +270,29 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 		if option.SelectDB != 0 {
 			init = append(init, []string{"SELECT", strconv.Itoa(option.SelectDB)})
 		}
+		if option.ReplicaOnly && option.Sentinel.MasterSet == "" {
+			init = append(init, []string{"READONLY"})
+		}
 		if option.ClientNoTouch {
 			init = append(init, []string{"CLIENT", "NO-TOUCH", "ON"})
 		}
 		if option.ClientNoEvict {
 			init = append(init, []string{"CLIENT", "NO-EVICT", "ON"})
 		}
-		if option.ClientSetInfo != nil {
-			init = append(init, append([]string{"CLIENT", "SETINFO"}, option.ClientSetInfo...))
+		if len(option.ClientSetInfo) == 2 {
+			init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", option.ClientSetInfo[0]}, []string{"CLIENT", "SETINFO", "LIB-VER", option.ClientSetInfo[1]})
 		} else {
-			init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", LIB_NAME, "LIB-VER", LIB_VER})
+			init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", LibName}, []string{"CLIENT", "SETINFO", "LIB-VER", LibVer})
 		}
 		p.version = 5
 		if len(init) != 0 {
 			resp := p.DoMulti(ctx, cmds.NewMultiCompleted(init)...)
 			defer resultsp.Put(resp)
-			for _, r := range resp.s[:len(resp.s)-1] { // skip error checking on the last CLIENT SETINFO
+			for i, r := range resp.s[:len(resp.s)-2] { // skip error checking on the last CLIENT SETINFO
+				if init[i][0] == "READONLY" {
+					// ignore READONLY command error
+					continue
+				}
 				if err = r.Error(); err != nil {
 					p.Close()
 					return nil, err
@@ -302,16 +332,16 @@ func (p *pipe) _background() {
 		atomic.CompareAndSwapInt32(&p.state, 2, 3) // make write goroutine to exit
 		atomic.AddInt32(&p.waits, 1)
 		go func() {
-			<-p.queue.PutOne(cmds.QuitCmd)
+			<-p.queue.PutOne(cmds.PingCmd)
 			atomic.AddInt32(&p.waits, -1)
 		}()
 	}
-
+	err := p.Error()
 	p.nsubs.Close()
 	p.psubs.Close()
 	p.ssubs.Close()
 	if old := p.pshks.Swap(emptypshks).(*pshks); old.close != nil {
-		old.close <- p.Error()
+		old.close <- err
 		close(old.close)
 	}
 
@@ -328,6 +358,8 @@ func (p *pipe) _background() {
 	if p.onInvalidations != nil {
 		p.onInvalidations(nil)
 	}
+
+	resp := newErrResult(err)
 	for atomic.LoadInt32(&p.waits) != 0 {
 		select {
 		case <-p.close:
@@ -335,11 +367,10 @@ func (p *pipe) _background() {
 		default:
 		}
 		if _, _, ch, resps, cond = p.queue.NextResultCh(); ch != nil {
-			err := newErrResult(p.Error())
 			for i := range resps {
-				resps[i] = err
+				resps[i] = resp
 			}
-			ch <- err
+			ch <- resp
 			cond.L.Unlock()
 			cond.Signal()
 		} else {
@@ -379,7 +410,14 @@ func (p *pipe) _backgroundWrite() (err error) {
 					runtime.Gosched()
 					continue
 				}
-				if flushDelay != 0 && atomic.LoadInt32(&p.waits) > 1 { // do not delay for sequential usage
+				// Blocking commands are executed in dedicated client which is aquired from pool.
+				// So, there is no sense to wait other commands to be written.
+				// https://github.com/redis/rueidis/issues/379
+				blocked := ones[0].IsBlock()
+				for i := 0; i < len(multi) && !blocked; i++ {
+					blocked = blocked || multi[i].IsBlock()
+				}
+				if flushDelay != 0 && !blocked && atomic.LoadInt32(&p.waits) > 1 { // do not delay for sequential usage
 					time.Sleep(flushDelay - time.Since(flushStart)) // ref: https://github.com/redis/rueidis/issues/156
 				}
 			}
@@ -391,7 +429,7 @@ func (p *pipe) _backgroundWrite() (err error) {
 			err = writeCmd(p.w, cmd.Commands())
 		}
 		if err != nil {
-			if err != ErrClosing { // ignore ErrClosing to allow final QUIT command to be sent
+			if err != ErrClosing { // ignore ErrClosing to allow final PING command to be sent
 				return
 			}
 			runtime.Gosched()
@@ -758,6 +796,10 @@ func (p *pipe) Info() map[string]RedisMessage {
 	return p.info
 }
 
+func (p *pipe) Version() int {
+	return int(p.version)
+}
+
 func (p *pipe) Do(ctx context.Context, cmd Completed) (resp RedisResult) {
 	if err := ctx.Err(); err != nil {
 		return newErrResult(err)
@@ -823,11 +865,11 @@ queue:
 			atomic.AddInt32(&p.recvs, 1)
 		case <-ctxCh:
 			resp = newErrResult(ctx.Err())
-			go func() {
+			go func(ch chan RedisResult) {
 				<-ch
 				atomic.AddInt32(&p.waits, -1)
 				atomic.AddInt32(&p.recvs, 1)
-			}()
+			}(ch)
 		}
 	}
 	return resp
@@ -933,12 +975,12 @@ queue:
 	atomic.AddInt32(&p.recvs, 1)
 	return resp
 abort:
-	go func(resp *redisresults) {
+	go func(resp *redisresults, ch chan RedisResult) {
 		<-ch
 		resultsp.Put(resp)
 		atomic.AddInt32(&p.waits, -1)
 		atomic.AddInt32(&p.recvs, 1)
-	}(resp)
+	}(resp, ch)
 	resp = resultsp.Get(len(multi), len(multi))
 	err := newErrResult(ctx.Err())
 	for i := 0; i < len(resp.s); i++ {
@@ -1270,7 +1312,7 @@ func (p *pipe) Close() {
 			p.background()
 		}
 		if block == 1 && (stopping1 || stopping2) { // make sure there is no block cmd
-			<-p.queue.PutOne(cmds.QuitCmd)
+			<-p.queue.PutOne(cmds.PingCmd)
 		}
 	}
 	atomic.AddInt32(&p.waits, -1)

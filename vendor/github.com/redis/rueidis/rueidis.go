@@ -1,6 +1,8 @@
 // Package rueidis is a fast Golang Redis RESP3 client that does auto pipelining and supports client side caching.
 package rueidis
 
+//go:generate go run hack/cmds/gen.go internal/cmds hack/cmds/*.json
+
 import (
 	"context"
 	"crypto/tls"
@@ -28,6 +30,8 @@ const (
 	DefaultReadBuffer = 1 << 19
 	// DefaultWriteBuffer is the default value of bufio.NewWriterSize for each connection, which is 0.5MiB
 	DefaultWriteBuffer = 1 << 19
+	// MaxPipelineMultiplex is the maximum meaningful value for ClientOption.PipelineMultiplex
+	MaxPipelineMultiplex = 8
 )
 
 var (
@@ -41,6 +45,11 @@ var (
 	ErrRESP2PubSubMixed = errors.New("rueidis does not support SUBSCRIBE/PSUBSCRIBE/SSUBSCRIBE mixed with other commands in RESP2")
 	// ErrDoCacheAborted means redis abort EXEC request or connection closed
 	ErrDoCacheAborted = errors.New("failed to fetch the cache because EXEC was aborted by redis or connection closed")
+	// ErrReplicaOnlyNotSupported means ReplicaOnly flag is not supported by
+	// current client
+	ErrReplicaOnlyNotSupported = errors.New("ReplicaOnly is not supported for single client")
+	// ErrWrongPipelineMultiplex means wrong value for ClientOption.PipelineMultiplex
+	ErrWrongPipelineMultiplex = errors.New("ClientOption.PipelineMultiplex must not be bigger than MaxPipelineMultiplex")
 )
 
 // ClientOption should be passed to NewClient to construct a Client
@@ -66,6 +75,11 @@ type ClientOption struct {
 	// Note that this function must be fast, otherwise other redis messages will be blocked.
 	OnInvalidations func([]RedisMessage)
 
+	// SendToReplicas is a function that returns true if the command should be sent to replicas.
+	// currently only used for cluster client.
+	// NOTE: This function can't be used with ReplicaOnly option.
+	SendToReplicas func(cmd Completed) bool
+
 	// Sentinel options, including MasterSet and Auth options
 	Sentinel SentinelOption
 
@@ -74,7 +88,12 @@ type ClientOption struct {
 	Password   string
 	ClientName string
 
-	// ClientSetInfo will assign various info attributes to the current connection
+	// AuthCredentialsFn allows for setting the AUTH username and password dynamically on each connection attempt to
+	// support rotating credentials
+	AuthCredentialsFn func(AuthCredentialsContext) (AuthCredentials, error)
+
+	// ClientSetInfo will assign various info attributes to the current connection.
+	// Note that ClientSetInfo should have exactly 2 values, the lib name and the lib version respectively.
 	ClientSetInfo []string
 
 	// InitAddress point to redis nodes.
@@ -111,7 +130,7 @@ type ClientOption struct {
 
 	// PipelineMultiplex determines how many tcp connections used to pipeline commands to one redis instance.
 	// The default for single and sentinel clients is 2, which means 4 connections (2^2).
-	// For cluster client, PipelineMultiplex doesn't have any effect.
+	// The default for cluster clients is 0, which means 1 connection (2^0).
 	PipelineMultiplex int
 
 	// ConnWriteTimeout is applied net.Conn.SetWriteDeadline and periodic PING to redis
@@ -146,7 +165,6 @@ type ClientOption struct {
 	ForceSingleClient bool
 
 	// ReplicaOnly indicates that this client will only try to connect to readonly replicas of redis setup.
-	// currently, it is only implemented for sentinel client
 	ReplicaOnly bool
 
 	// ClientNoEvict sets the client eviction mode for the current connection.
@@ -262,6 +280,17 @@ type CacheableTTL struct {
 	TTL time.Duration
 }
 
+// AuthCredentialsContext is the parameter container of AuthCredentialsFn
+type AuthCredentialsContext struct {
+	Address net.Addr
+}
+
+// AuthCredentials is the output of AuthCredentialsFn
+type AuthCredentials struct {
+	Username string
+	Password string
+}
+
 // NewClient uses ClientOption to initialize the Client for both cluster client and single client.
 // It will first try to connect as cluster client. If the len(ClientOption.InitAddress) == 1 and
 // the address does not enable cluster mode, the NewClient() will use single client instead.
@@ -289,22 +318,25 @@ func NewClient(option ClientOption) (client Client, err error) {
 			option.InitAddress[i], option.InitAddress[j] = option.InitAddress[j], option.InitAddress[i]
 		})
 	}
+	if option.PipelineMultiplex > MaxPipelineMultiplex {
+		return nil, ErrWrongPipelineMultiplex
+	}
 	if option.Sentinel.MasterSet != "" {
 		option.PipelineMultiplex = singleClientMultiplex(option.PipelineMultiplex)
 		return newSentinelClient(&option, makeConn)
 	}
-	pmbk := option.PipelineMultiplex
-	option.PipelineMultiplex = 0 // PipelineMultiplex is meaningless for cluster client
-
 	if option.ForceSingleClient {
-		option.PipelineMultiplex = singleClientMultiplex(pmbk)
+		option.PipelineMultiplex = singleClientMultiplex(option.PipelineMultiplex)
 		return newSingleClient(&option, nil, makeConn)
 	}
 	if client, err = newClusterClient(&option, makeConn); err != nil {
+		if client == (*clusterClient)(nil) {
+			return nil, err
+		}
 		if len(option.InitAddress) == 1 && (err.Error() == redisErrMsgCommandNotAllow || strings.Contains(strings.ToUpper(err.Error()), "CLUSTER")) {
-			option.PipelineMultiplex = singleClientMultiplex(pmbk)
+			option.PipelineMultiplex = singleClientMultiplex(option.PipelineMultiplex)
 			client, err = newSingleClient(&option, client.(*clusterClient).single(), makeConn)
-		} else if client != (*clusterClient)(nil) {
+		} else {
 			client.Close()
 			return nil, err
 		}
@@ -341,3 +373,4 @@ func dial(dst string, opt *ClientOption) (conn net.Conn, err error) {
 }
 
 const redisErrMsgCommandNotAllow = "command is not allowed"
+const dedicatedClientUsedAfterReleased = "DedicatedClient should not be used after recycled"
