@@ -20,6 +20,10 @@ func newSingleClient(opt *ClientOption, prev conn, connFn connFn) (*singleClient
 		return nil, ErrNoAddr
 	}
 
+	if opt.ReplicaOnly {
+		return nil, ErrReplicaOnlyNotSupported
+	}
+
 	conn := connFn(opt.InitAddress[0], opt)
 	conn.Override(prev)
 	if err := conn.Dial(); err != nil {
@@ -154,6 +158,7 @@ func (c *dedicatedSingleClient) B() Builder {
 
 func (c *dedicatedSingleClient) Do(ctx context.Context, cmd Completed) (resp RedisResult) {
 retry:
+	c.check()
 	resp = c.wire.Do(ctx, cmd)
 	if c.retry && cmd.IsReadOnly() && isRetryable(resp.NonRedisError(), c.wire, ctx) {
 		goto retry
@@ -173,6 +178,7 @@ func (c *dedicatedSingleClient) DoMulti(ctx context.Context, multi ...Completed)
 		retryable = allReadOnly(multi)
 	}
 retry:
+	c.check()
 	resp = c.wire.DoMulti(ctx, multi...).s
 	if retryable && anyRetryable(resp, c.wire, ctx) {
 		goto retry
@@ -187,6 +193,7 @@ retry:
 
 func (c *dedicatedSingleClient) Receive(ctx context.Context, subscribe Completed, fn func(msg PubSubMessage)) (err error) {
 retry:
+	c.check()
 	err = c.wire.Receive(ctx, subscribe, fn)
 	if c.retry {
 		if _, ok := err.(*RedisError); !ok && isRetryable(err, c.wire, ctx) {
@@ -200,12 +207,19 @@ retry:
 }
 
 func (c *dedicatedSingleClient) SetPubSubHooks(hooks PubSubHooks) <-chan error {
+	c.check()
 	return c.wire.SetPubSubHooks(hooks)
 }
 
 func (c *dedicatedSingleClient) Close() {
 	c.wire.Close()
 	c.release()
+}
+
+func (c *dedicatedSingleClient) check() {
+	if atomic.LoadUint32(&c.mark) != 0 {
+		panic(dedicatedClientUsedAfterReleased)
+	}
 }
 
 func (c *dedicatedSingleClient) release() {

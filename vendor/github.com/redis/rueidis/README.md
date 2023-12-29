@@ -172,6 +172,29 @@ client.DoCache(ctx, client.B().Get().Key("prefix1:1").Cache(), time.Minute).IsCa
 Please make sure that commands passed to `DoCache()` and `DoMultiCache()` are covered by your prefixes.
 Otherwise, their client-side cache will not be invalidated by redis.
 
+### Client Side Caching with Cache Aside Pattern
+
+Cache-Aside is a widely used pattern to cache other data sources into Redis. For example:
+
+```go
+client, err := rueidisaside.NewClient(rueidisaside.ClientOption{
+    ClientOption: rueidis.ClientOption{InitAddress: []string{"127.0.0.1:6379"}},
+})
+if err != nil {
+    panic(err)
+}
+val, err := client.Get(context.Background(), time.Minute, "mykey", func(ctx context.Context, key string) (val string, err error) {
+    if err = db.QueryRowContext(ctx, "SELECT val FROM mytab WHERE id = ?", key).Scan(&val); err == sql.ErrNoRows {
+        val = "_nil_" // cache nil to avoid penetration.
+        err = nil     // clear err in case of sql.ErrNoRows.
+    }
+    return
+})
+// ...
+```
+
+Please refer to the full example at [rueidisaside](https://github.com/redis/rueidis/blob/main/rueidisaside/README.md).
+
 ### Disable Client Side Caching
 
 Some Redis provider doesn't support client-side caching, ex. Google Cloud Memorystore.
@@ -278,6 +301,8 @@ Its size is controlled by the `ClientOption.RingScaleEachConn` and the default v
 If you have many rueidis connections, you may find that they occupy quite amount of memory.
 In that case, you may consider reducing `ClientOption.RingScaleEachConn` to 8 or 9 at the cost of potential throughput degradation.
 
+You may also consider setting the value of `ClientOption.PipelineMultiplex` to `-1`, which will let rueidis use only 1 connection for pipelining to each redis node.
+
 ## Lua Script
 
 The `NewLuaScript` or `NewLuaScriptReadOnly` will create a script which is safe for concurrent usage.
@@ -319,6 +344,23 @@ client, err := rueidis.NewClient(rueidis.ClientOption{
     },
 })
 ```
+
+### Redis URL
+
+You can use `ParseURL` or `MustParseURL` to construct a `ClientOption`:
+
+```go
+// connect to a redis cluster
+client, err = rueidis.NewClient(rueidis.MustParseURL("redis://127.0.0.1:7001?addr=127.0.0.1:7002&addr=127.0.0.1:7003"))
+// connect to a redis node
+client, err = rueidis.NewClient(rueidis.MustParseURL("redis://127.0.0.1:6379/0"))
+// connect to a redis sentinel
+client, err = rueidis.NewClient(rueidis.MustParseURL("redis://127.0.0.1:26379/0?master_set=my_master"))
+```
+
+The url must be started with either `redis://`, `rediss://` or `unix://`.
+
+Currently supported parameters `dial_timeout`, `write_timeout`, `protocol`, `client_cache`, `client_name`, `max_retries`
 
 ## Arbitrary Command
 
@@ -398,6 +440,8 @@ client.Do(ctx, client.B().Lindex().Key("k").Index(0).Build()).ToString()
 // LPOP
 client.Do(ctx, client.B().Lpop().Key("k").Build()).ToString()
 client.Do(ctx, client.B().Lpop().Key("k").Count(2).Build()).AsStrSlice()
+// SCAN
+client.Do(ctx, client.B().Scan().Cursor(0).Build()).AsScanEntry()
 // FT.SEARCH
 client.Do(ctx, client.B().FtSearch().Index("idx").Query("@f:v").Build()).AsFtSearch()
 // GEOSEARCH
@@ -416,5 +460,23 @@ module mymodule
 
 go 1.18
 
-require github.com/redis/rueidis v1.0.14-go1.18
+require github.com/redis/rueidis v1.0.26-go1.18
 ```
+
+## Contributing
+
+Contributions are welcome, including [issues](https://github.com/redis/rueidis/issues), [pull requests](https://github.com/redis/rueidis/pulls), and [discussions](https://github.com/redis/rueidis/discussions).
+Contributions mean a lot to us and help us improve this library and the community!
+
+### Generate command builders
+
+Command builders are generated based on the definitions in [./hack/cmds](./hack/cmds) by running:
+
+```sh
+go generate
+```
+
+### Testing
+
+Please use the [./dockertest.sh](./dockertest.sh) script for running test cases locally.
+And please try your best to have 100% test coverage on code changes.
