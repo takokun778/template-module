@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -142,6 +143,23 @@ retry:
 	return err
 }
 
+func (c *sentinelClient) DoStream(ctx context.Context, cmd Completed) RedisResultStream {
+	resp := c.mConn.Load().(conn).DoStream(ctx, cmd)
+	cmds.PutCompleted(cmd)
+	return resp
+}
+
+func (c *sentinelClient) DoMultiStream(ctx context.Context, multi ...Completed) MultiRedisResultStream {
+	if len(multi) == 0 {
+		return RedisResultStream{e: io.EOF}
+	}
+	s := c.mConn.Load().(conn).DoMultiStream(ctx, multi...)
+	for _, cmd := range multi {
+		cmds.PutCompleted(cmd)
+	}
+	return s
+}
+
 func (c *sentinelClient) Dedicated(fn func(DedicatedClient) error) (err error) {
 	master := c.mConn.Load().(conn)
 	wire := master.Acquire()
@@ -252,7 +270,7 @@ retry:
 }
 
 func (c *sentinelClient) refresh() (err error) {
-	return c.sc.Do(c._refresh)
+	return c.sc.Do(context.Background(), c._refresh)
 }
 
 func (c *sentinelClient) _refresh() (err error) {
