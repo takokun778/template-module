@@ -23,6 +23,14 @@ func IsRedisNil(err error) bool {
 	return err == Nil
 }
 
+// IsRedisBusyGroup checks if it is a redis BUSYGROUP message.
+func IsRedisBusyGroup(err error) bool {
+	if ret, yes := IsRedisErr(err); yes {
+		return ret.IsBusyGroup()
+	}
+	return false
+}
+
 // IsRedisErr is a handy method to check if error is a redis ERR response.
 func IsRedisErr(err error) (ret *RedisError, ok bool) {
 	ret, ok = err.(*RedisError)
@@ -73,6 +81,11 @@ func (r *RedisError) IsClusterDown() bool {
 // IsNoScript checks if it is a redis NOSCRIPT message.
 func (r *RedisError) IsNoScript() bool {
 	return strings.HasPrefix(r.string, "NOSCRIPT")
+}
+
+// IsBusyGroup checks if it is a redis BUSYGROUP message.
+func (r *RedisError) IsBusyGroup() bool {
+	return strings.HasPrefix(r.string, "BUSYGROUP")
 }
 
 func newResult(val RedisMessage, err error) RedisResult {
@@ -449,6 +462,29 @@ func (r RedisResult) CachePXAT() int64 {
 	return r.val.CachePXAT()
 }
 
+// String returns human-readable representation of RedisResult
+func (r *RedisResult) String() string {
+	v, _ := (*prettyRedisResult)(r).MarshalJSON()
+	return string(v)
+}
+
+type prettyRedisResult RedisResult
+
+// MarshalJSON implements json.Marshaler interface
+func (r *prettyRedisResult) MarshalJSON() ([]byte, error) {
+	type PrettyRedisResult struct {
+		Message *prettyRedisMessage `json:"Message,omitempty"`
+		Error   string              `json:"Error,omitempty"`
+	}
+	obj := PrettyRedisResult{}
+	if r.err != nil {
+		obj.Error = r.err.Error()
+	} else {
+		obj.Message = (*prettyRedisMessage)(&r.val)
+	}
+	return json.Marshal(obj)
+}
+
 // RedisMessage is a redis response message, it may be a nil response
 type RedisMessage struct {
 	attrs   *RedisMessage
@@ -674,9 +710,15 @@ func (m *RedisMessage) AsIntSlice() ([]int64, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := make([]int64, 0, len(values))
-	for _, v := range values {
-		s = append(s, v.integer)
+	s := make([]int64, len(values))
+	for i, v := range values {
+		if len(v.string) != 0 {
+			if s[i], err = strconv.ParseInt(v.string, 10, 64); err != nil {
+				return nil, err
+			}
+		} else {
+			s[i] = v.integer
+		}
 	}
 	return s, nil
 }
@@ -688,16 +730,14 @@ func (m *RedisMessage) AsFloatSlice() ([]float64, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := make([]float64, 0, len(values))
-	for _, v := range values {
+	s := make([]float64, len(values))
+	for i, v := range values {
 		if len(v.string) != 0 {
-			i, err := util.ToFloat64(v.string)
-			if err != nil {
+			if s[i], err = util.ToFloat64(v.string); err != nil {
 				return nil, err
 			}
-			s = append(s, i)
 		} else {
-			s = append(s, float64(v.integer))
+			s[i] = float64(v.integer)
 		}
 	}
 	return s, nil
@@ -834,8 +874,8 @@ func (m *RedisMessage) AsZScores() ([]ZScore, error) {
 
 // ScanEntry is the element type of both SCAN, SSCAN, HSCAN and ZSCAN command response.
 type ScanEntry struct {
-	Cursor   uint64
 	Elements []string
+	Cursor   uint64
 }
 
 // AsScanEntry check if message is a redis array/set response of length 2, and convert to ScanEntry.
@@ -1235,4 +1275,49 @@ func (m *RedisMessage) approximateSize() (s int) {
 		s += v.approximateSize()
 	}
 	return
+}
+
+// String returns human-readable representation of RedisMessage
+func (m *RedisMessage) String() string {
+	v, _ := (*prettyRedisMessage)(m).MarshalJSON()
+	return string(v)
+}
+
+type prettyRedisMessage RedisMessage
+
+// MarshalJSON implements json.Marshaler interface
+func (m *prettyRedisMessage) MarshalJSON() ([]byte, error) {
+	type PrettyRedisMessage struct {
+		Value any    `json:"Value,omitempty"`
+		Type  string `json:"Type,omitempty"`
+		Error string `json:"Error,omitempty"`
+		Ttl   string `json:"TTL,omitempty"`
+	}
+	org := (*RedisMessage)(m)
+	strType, ok := typeNames[m.typ]
+	if !ok {
+		strType = "unknown"
+	}
+	obj := PrettyRedisMessage{Type: strType}
+	if m.ttl != [7]byte{} {
+		obj.Ttl = time.UnixMilli(org.CachePXAT()).UTC().String()
+	}
+	if err := org.Error(); err != nil {
+		obj.Error = err.Error()
+	}
+	switch m.typ {
+	case typeFloat, typeBlobString, typeSimpleString, typeVerbatimString, typeBigNumber:
+		obj.Value = m.string
+	case typeBool:
+		obj.Value = m.integer == 1
+	case typeInteger:
+		obj.Value = m.integer
+	case typeMap, typeSet, typeArray:
+		values := make([]prettyRedisMessage, len(m.values))
+		for i, value := range m.values {
+			values[i] = prettyRedisMessage(value)
+		}
+		obj.Value = values
+	}
+	return json.Marshal(obj)
 }

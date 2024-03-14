@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"regexp"
@@ -19,8 +20,8 @@ import (
 	"github.com/redis/rueidis/internal/util"
 )
 
-const LIB_NAME = "rueidis"
-const LIB_VER = "1.0.14"
+const LibName = "rueidis"
+const LibVer = "1.0.32"
 
 var noHello = regexp.MustCompile("unknown command .?(HELLO|hello).?")
 
@@ -30,7 +31,10 @@ type wire interface {
 	DoMulti(ctx context.Context, multi ...Completed) *redisresults
 	DoMultiCache(ctx context.Context, multi ...CacheableTTL) *redisresults
 	Receive(ctx context.Context, subscribe Completed, fn func(message PubSubMessage)) error
+	DoStream(ctx context.Context, pool *pool, cmd Completed) RedisResultStream
+	DoMultiStream(ctx context.Context, pool *pool, multi ...Completed) MultiRedisResultStream
 	Info() map[string]RedisMessage
+	Version() int
 	Error() error
 	Close()
 
@@ -82,19 +86,19 @@ var _ wire = (*pipe)(nil)
 type pipe struct {
 	conn            net.Conn
 	error           atomic.Value
-	clhks           atomic.Value
-	pshks           atomic.Value
+	clhks           atomic.Value // closed hook, invoked after the conn is closed
+	pshks           atomic.Value // pubsub hook, registered by the SetPubSubHooks
 	queue           queue
 	cache           CacheStore
 	r               *bufio.Reader
 	w               *bufio.Writer
 	close           chan struct{}
 	onInvalidations func([]RedisMessage)
-	r2psFn          func() (p *pipe, err error)
-	r2pipe          *pipe
-	ssubs           *subs
-	nsubs           *subs
-	psubs           *subs
+	r2psFn          func() (p *pipe, err error) // func to build pipe for resp2 pubsub
+	r2pipe          *pipe                       // internal pipe for resp2 pubsub only
+	ssubs           *subs                       // pubsub smessage subscriptions
+	nsubs           *subs                       // pubsub  message subscriptions
+	psubs           *subs                       // pubsub pmessage subscriptions
 	info            map[string]RedisMessage
 	timeout         time.Duration
 	pinggap         time.Duration
@@ -107,14 +111,20 @@ type pipe struct {
 	state           int32
 	waits           int32
 	recvs           int32
-	r2ps            bool
+	r2ps            bool // identify this pipe is used for resp2 pubsub or not
 }
+
+type pipeFn func(connFn func() (net.Conn, error), option *ClientOption) (p *pipe, err error)
 
 func newPipe(connFn func() (net.Conn, error), option *ClientOption) (p *pipe, err error) {
-	return _newPipe(connFn, option, false)
+	return _newPipe(connFn, option, false, false)
 }
 
-func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) (p *pipe, err error) {
+func newPipeNoBg(connFn func() (net.Conn, error), option *ClientOption) (p *pipe, err error) {
+	return _newPipe(connFn, option, false, true)
+}
+
+func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps, nobg bool) (p *pipe, err error) {
 	conn, err := connFn()
 	if err != nil {
 		return nil, err
@@ -138,7 +148,7 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 	}
 	if !r2ps {
 		p.r2psFn = func() (p *pipe, err error) {
-			return _newPipe(connFn, option, true)
+			return _newPipe(connFn, option, true, nobg)
 		}
 	}
 	if !option.DisableCache {
@@ -151,17 +161,32 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 	p.pshks.Store(emptypshks)
 	p.clhks.Store(emptyclhks)
 
+	username := option.Username
+	password := option.Password
+	if option.AuthCredentialsFn != nil {
+		authCredentialsContext := AuthCredentialsContext{
+			Address: conn.RemoteAddr(),
+		}
+		authCredentials, err := option.AuthCredentialsFn(authCredentialsContext)
+		if err != nil {
+			p.Close()
+			return nil, err
+		}
+		username = authCredentials.Username
+		password = authCredentials.Password
+	}
+
 	helloCmd := []string{"HELLO", "3"}
-	if option.Password != "" && option.Username == "" {
-		helloCmd = append(helloCmd, "AUTH", "default", option.Password)
-	} else if option.Username != "" {
-		helloCmd = append(helloCmd, "AUTH", option.Username, option.Password)
+	if password != "" && username == "" {
+		helloCmd = append(helloCmd, "AUTH", "default", password)
+	} else if username != "" {
+		helloCmd = append(helloCmd, "AUTH", username, password)
 	}
 	if option.ClientName != "" {
 		helloCmd = append(helloCmd, "SETNAME", option.ClientName)
 	}
 
-	init := make([][]string, 0, 4)
+	init := make([][]string, 0, 5)
 	if option.ClientTrackingOptions == nil {
 		init = append(init, helloCmd, []string{"CLIENT", "TRACKING", "ON", "OPTIN"})
 	} else {
@@ -173,16 +198,19 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 	if option.SelectDB != 0 {
 		init = append(init, []string{"SELECT", strconv.Itoa(option.SelectDB)})
 	}
+	if option.ReplicaOnly && option.Sentinel.MasterSet == "" {
+		init = append(init, []string{"READONLY"})
+	}
 	if option.ClientNoTouch {
 		init = append(init, []string{"CLIENT", "NO-TOUCH", "ON"})
 	}
 	if option.ClientNoEvict {
 		init = append(init, []string{"CLIENT", "NO-EVICT", "ON"})
 	}
-	if option.ClientSetInfo != nil {
-		init = append(init, append([]string{"CLIENT", "SETINFO"}, option.ClientSetInfo...))
+	if len(option.ClientSetInfo) == 2 {
+		init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", option.ClientSetInfo[0]}, []string{"CLIENT", "SETINFO", "LIB-VER", option.ClientSetInfo[1]})
 	} else {
-		init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", LIB_NAME, "LIB-VER", LIB_VER})
+		init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", LibName}, []string{"CLIENT", "SETINFO", "LIB-VER", LibVer})
 	}
 
 	timeout := option.Dialer.Timeout
@@ -197,13 +225,17 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 	if !r2 && !r2ps {
 		resp := p.DoMulti(ctx, cmds.NewMultiCompleted(init)...)
 		defer resultsp.Put(resp)
-		for i, r := range resp.s[:len(resp.s)-1] { // skip error checking on the last CLIENT SETINFO
+		for i, r := range resp.s[:len(resp.s)-2] { // skip error checking on the last CLIENT SETINFO
 			if i == 0 {
 				p.info, err = r.AsMap()
 			} else {
 				err = r.Error()
 			}
 			if err != nil {
+				if init[i][0] == "READONLY" {
+					// ignore READONLY command error
+					continue
+				}
 				if re, ok := err.(*RedisError); ok {
 					if !r2 && noHello.MatchString(re.string) {
 						r2 = true
@@ -236,10 +268,10 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 			return nil, ErrNoCache
 		}
 		init = init[:0]
-		if option.Password != "" && option.Username == "" {
-			init = append(init, []string{"AUTH", option.Password})
-		} else if option.Username != "" {
-			init = append(init, []string{"AUTH", option.Username, option.Password})
+		if password != "" && username == "" {
+			init = append(init, []string{"AUTH", password})
+		} else if username != "" {
+			init = append(init, []string{"AUTH", username, password})
 		}
 		if option.ClientName != "" {
 			init = append(init, []string{"CLIENT", "SETNAME", option.ClientName})
@@ -247,22 +279,29 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 		if option.SelectDB != 0 {
 			init = append(init, []string{"SELECT", strconv.Itoa(option.SelectDB)})
 		}
+		if option.ReplicaOnly && option.Sentinel.MasterSet == "" {
+			init = append(init, []string{"READONLY"})
+		}
 		if option.ClientNoTouch {
 			init = append(init, []string{"CLIENT", "NO-TOUCH", "ON"})
 		}
 		if option.ClientNoEvict {
 			init = append(init, []string{"CLIENT", "NO-EVICT", "ON"})
 		}
-		if option.ClientSetInfo != nil {
-			init = append(init, append([]string{"CLIENT", "SETINFO"}, option.ClientSetInfo...))
+		if len(option.ClientSetInfo) == 2 {
+			init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", option.ClientSetInfo[0]}, []string{"CLIENT", "SETINFO", "LIB-VER", option.ClientSetInfo[1]})
 		} else {
-			init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", LIB_NAME, "LIB-VER", LIB_VER})
+			init = append(init, []string{"CLIENT", "SETINFO", "LIB-NAME", LibName}, []string{"CLIENT", "SETINFO", "LIB-VER", LibVer})
 		}
 		p.version = 5
 		if len(init) != 0 {
 			resp := p.DoMulti(ctx, cmds.NewMultiCompleted(init)...)
 			defer resultsp.Put(resp)
-			for _, r := range resp.s[:len(resp.s)-1] { // skip error checking on the last CLIENT SETINFO
+			for i, r := range resp.s[:len(resp.s)-2] { // skip error checking on the last CLIENT SETINFO
+				if init[i][0] == "READONLY" {
+					// ignore READONLY command error
+					continue
+				}
 				if err = r.Error(); err != nil {
 					p.Close()
 					return nil, err
@@ -270,11 +309,13 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 			}
 		}
 	}
-	if p.onInvalidations != nil || option.AlwaysPipelining {
-		p.background()
-	}
-	if p.timeout > 0 && p.pinggap > 0 {
-		go p.backgroundPing()
+	if !nobg {
+		if p.onInvalidations != nil || option.AlwaysPipelining {
+			p.background()
+		}
+		if p.timeout > 0 && p.pinggap > 0 {
+			go p.backgroundPing()
+		}
 	}
 	return p, nil
 }
@@ -302,16 +343,16 @@ func (p *pipe) _background() {
 		atomic.CompareAndSwapInt32(&p.state, 2, 3) // make write goroutine to exit
 		atomic.AddInt32(&p.waits, 1)
 		go func() {
-			<-p.queue.PutOne(cmds.QuitCmd)
+			<-p.queue.PutOne(cmds.PingCmd)
 			atomic.AddInt32(&p.waits, -1)
 		}()
 	}
-
+	err := p.Error()
 	p.nsubs.Close()
 	p.psubs.Close()
 	p.ssubs.Close()
 	if old := p.pshks.Swap(emptypshks).(*pshks); old.close != nil {
-		old.close <- p.Error()
+		old.close <- err
 		close(old.close)
 	}
 
@@ -328,6 +369,8 @@ func (p *pipe) _background() {
 	if p.onInvalidations != nil {
 		p.onInvalidations(nil)
 	}
+
+	resp := newErrResult(err)
 	for atomic.LoadInt32(&p.waits) != 0 {
 		select {
 		case <-p.close:
@@ -335,11 +378,10 @@ func (p *pipe) _background() {
 		default:
 		}
 		if _, _, ch, resps, cond = p.queue.NextResultCh(); ch != nil {
-			err := newErrResult(p.Error())
 			for i := range resps {
-				resps[i] = err
+				resps[i] = resp
 			}
-			ch <- err
+			ch <- resp
 			cond.L.Unlock()
 			cond.Signal()
 		} else {
@@ -380,7 +422,16 @@ func (p *pipe) _backgroundWrite() (err error) {
 					continue
 				}
 				if flushDelay != 0 && atomic.LoadInt32(&p.waits) > 1 { // do not delay for sequential usage
-					time.Sleep(flushDelay - time.Since(flushStart)) // ref: https://github.com/redis/rueidis/issues/156
+					// Blocking commands are executed in dedicated client which is acquired from pool.
+					// So, there is no sense to wait other commands to be written.
+					// https://github.com/redis/rueidis/issues/379
+					var blocked bool
+					for i := 0; i < len(multi) && !blocked; i++ {
+						blocked = blocked || multi[i].IsBlock()
+					}
+					if !blocked {
+						time.Sleep(flushDelay - time.Since(flushStart)) // ref: https://github.com/redis/rueidis/issues/156
+					}
 				}
 			}
 		}
@@ -391,7 +442,7 @@ func (p *pipe) _backgroundWrite() (err error) {
 			err = writeCmd(p.w, cmd.Commands())
 		}
 		if err != nil {
-			if err != ErrClosing { // ignore ErrClosing to allow final QUIT command to be sent
+			if err != ErrClosing { // ignore ErrClosing to allow the final PING command to be sent
 				return
 			}
 			runtime.Gosched()
@@ -758,6 +809,10 @@ func (p *pipe) Info() map[string]RedisMessage {
 	return p.info
 }
 
+func (p *pipe) Version() int {
+	return int(p.version)
+}
+
 func (p *pipe) Do(ctx context.Context, cmd Completed) (resp RedisResult) {
 	if err := ctx.Err(); err != nil {
 		return newErrResult(err)
@@ -804,7 +859,7 @@ func (p *pipe) Do(ctx context.Context, cmd Completed) (resp RedisResult) {
 	} else {
 		resp = newErrResult(p.Error())
 	}
-	if left := atomic.AddInt32(&p.waits, -1); state == 0 && waits == 1 && left != 0 {
+	if left := atomic.AddInt32(&p.waits, -1); state == 0 && left != 0 {
 		p.background()
 	}
 	atomic.AddInt32(&p.recvs, 1)
@@ -814,23 +869,23 @@ queue:
 	ch := p.queue.PutOne(cmd)
 	if ctxCh := ctx.Done(); ctxCh == nil {
 		resp = <-ch
-		atomic.AddInt32(&p.waits, -1)
-		atomic.AddInt32(&p.recvs, 1)
 	} else {
 		select {
 		case resp = <-ch:
-			atomic.AddInt32(&p.waits, -1)
-			atomic.AddInt32(&p.recvs, 1)
 		case <-ctxCh:
-			resp = newErrResult(ctx.Err())
-			go func() {
-				<-ch
-				atomic.AddInt32(&p.waits, -1)
-				atomic.AddInt32(&p.recvs, 1)
-			}()
+			goto abort
 		}
 	}
+	atomic.AddInt32(&p.waits, -1)
+	atomic.AddInt32(&p.recvs, 1)
 	return resp
+abort:
+	go func(ch chan RedisResult) {
+		<-ch
+		atomic.AddInt32(&p.waits, -1)
+		atomic.AddInt32(&p.recvs, 1)
+	}(ch)
+	return newErrResult(ctx.Err())
 }
 
 func (p *pipe) DoMulti(ctx context.Context, multi ...Completed) *redisresults {
@@ -846,7 +901,6 @@ func (p *pipe) DoMulti(ctx context.Context, multi ...Completed) *redisresults {
 
 	isOptIn := multi[0].IsOptIn() // len(multi) > 0 should have already been checked by upper layer
 	noReply := 0
-	isBlock := false
 
 	for _, cmd := range multi {
 		if cmd.NoReply() {
@@ -868,21 +922,17 @@ func (p *pipe) DoMulti(ctx context.Context, multi ...Completed) *redisresults {
 
 	for _, cmd := range multi {
 		if cmd.IsBlock() {
-			isBlock = true
+			atomic.AddInt32(&p.blcksig, 1)
+			defer func() {
+				for _, r := range resp.s {
+					if r.err != nil {
+						return
+					}
+				}
+				atomic.AddInt32(&p.blcksig, -1)
+			}()
 			break
 		}
-	}
-
-	if isBlock {
-		atomic.AddInt32(&p.blcksig, 1)
-		defer func() {
-			for _, r := range resp.s {
-				if r.err != nil {
-					return
-				}
-			}
-			atomic.AddInt32(&p.blcksig, -1)
-		}()
 	}
 
 	waits := atomic.AddInt32(&p.waits, 1) // if this is 1, and background worker is not started, no need to queue
@@ -912,7 +962,7 @@ func (p *pipe) DoMulti(ctx context.Context, multi ...Completed) *redisresults {
 			resp.s[i] = err
 		}
 	}
-	if left := atomic.AddInt32(&p.waits, -1); state == 0 && waits == 1 && left != 0 {
+	if left := atomic.AddInt32(&p.waits, -1); state == 0 && left != 0 {
 		p.background()
 	}
 	atomic.AddInt32(&p.recvs, 1)
@@ -933,12 +983,12 @@ queue:
 	atomic.AddInt32(&p.recvs, 1)
 	return resp
 abort:
-	go func(resp *redisresults) {
+	go func(resp *redisresults, ch chan RedisResult) {
 		<-ch
 		resultsp.Put(resp)
 		atomic.AddInt32(&p.waits, -1)
 		atomic.AddInt32(&p.recvs, 1)
-	}(resp)
+	}(resp, ch)
 	resp = resultsp.Get(len(multi), len(multi))
 	err := newErrResult(ctx.Err())
 	for i := 0; i < len(resp.s); i++ {
@@ -947,8 +997,165 @@ abort:
 	return resp
 }
 
+type MultiRedisResultStream = RedisResultStream
+
+type RedisResultStream struct {
+	p *pool
+	w *pipe
+	e error
+	n int
+}
+
+// HasNext can be used in a for loop condition to check if a further WriteTo call is needed.
+func (s *RedisResultStream) HasNext() bool {
+	return s.n > 0 && s.e == nil
+}
+
+// Error returns the error happened when sending commands to redis or reading response from redis.
+// Usually a user is not required to use this function because the error is also reported by the WriteTo.
+func (s *RedisResultStream) Error() error {
+	return s.e
+}
+
+// WriteTo reads a redis response from redis and then write it to the given writer.
+// This function is not thread safe and should be called sequentially to read multiple responses.
+// An io.EOF error will be reported if all responses are read.
+func (s *RedisResultStream) WriteTo(w io.Writer) (n int64, err error) {
+	if err = s.e; err == nil && s.n > 0 {
+		var clean bool
+		if n, err, clean = streamTo(s.w.r, w); !clean {
+			s.e = err // err must not be nil in case of !clean
+			s.n = 1
+		}
+		if s.n--; s.n == 0 {
+			atomic.AddInt32(&s.w.blcksig, -1)
+			atomic.AddInt32(&s.w.waits, -1)
+			if s.e == nil {
+				s.e = io.EOF
+			} else {
+				s.w.Close()
+			}
+			s.p.Store(s.w)
+		}
+	}
+	return n, err
+}
+
+func (p *pipe) DoStream(ctx context.Context, pool *pool, cmd Completed) RedisResultStream {
+	cmds.CompletedCS(cmd).Verify()
+
+	if err := ctx.Err(); err != nil {
+		return RedisResultStream{e: err}
+	}
+
+	state := atomic.LoadInt32(&p.state)
+
+	if state == 1 {
+		panic("DoStream with auto pipelining is a bug")
+	}
+
+	if state == 0 {
+		atomic.AddInt32(&p.blcksig, 1)
+		waits := atomic.AddInt32(&p.waits, 1)
+		if waits != 1 {
+			panic("DoStream with racing is a bug")
+		}
+		dl, ok := ctx.Deadline()
+		if ok {
+			if p.timeout > 0 {
+				defaultDeadline := time.Now().Add(p.timeout)
+				if dl.After(defaultDeadline) {
+					dl = defaultDeadline
+				}
+			}
+			p.conn.SetDeadline(dl)
+		} else if p.timeout > 0 && !cmd.IsBlock() {
+			p.conn.SetDeadline(time.Now().Add(p.timeout))
+		} else {
+			p.conn.SetDeadline(time.Time{})
+		}
+		_ = writeCmd(p.w, cmd.Commands())
+		if err := p.w.Flush(); err != nil {
+			p.error.CompareAndSwap(nil, &errs{error: err})
+			p.conn.Close()
+			p.background() // start the background worker to clean up goroutines
+		} else {
+			return RedisResultStream{p: pool, w: p, n: 1}
+		}
+	}
+	atomic.AddInt32(&p.blcksig, -1)
+	atomic.AddInt32(&p.waits, -1)
+	pool.Store(p)
+	return RedisResultStream{e: p.Error()}
+}
+
+func (p *pipe) DoMultiStream(ctx context.Context, pool *pool, multi ...Completed) MultiRedisResultStream {
+	for _, cmd := range multi {
+		cmds.CompletedCS(cmd).Verify()
+	}
+
+	if err := ctx.Err(); err != nil {
+		return RedisResultStream{e: err}
+	}
+
+	state := atomic.LoadInt32(&p.state)
+
+	if state == 1 {
+		panic("DoMultiStream with auto pipelining is a bug")
+	}
+
+	if state == 0 {
+		atomic.AddInt32(&p.blcksig, 1)
+		waits := atomic.AddInt32(&p.waits, 1)
+		if waits != 1 {
+			panic("DoMultiStream with racing is a bug")
+		}
+		dl, ok := ctx.Deadline()
+		if ok {
+			if p.timeout > 0 {
+				defaultDeadline := time.Now().Add(p.timeout)
+				if dl.After(defaultDeadline) {
+					dl = defaultDeadline
+				}
+			}
+			p.conn.SetDeadline(dl)
+		} else if p.timeout > 0 {
+			for _, cmd := range multi {
+				if cmd.IsBlock() {
+					p.conn.SetDeadline(time.Time{})
+					goto process
+				}
+			}
+			p.conn.SetDeadline(time.Now().Add(p.timeout))
+		} else {
+			p.conn.SetDeadline(time.Time{})
+		}
+	process:
+		for _, cmd := range multi {
+			_ = writeCmd(p.w, cmd.Commands())
+		}
+		if err := p.w.Flush(); err != nil {
+			p.error.CompareAndSwap(nil, &errs{error: err})
+			p.conn.Close()
+			p.background() // start the background worker to clean up goroutines
+		} else {
+			return RedisResultStream{p: pool, w: p, n: len(multi)}
+		}
+	}
+	atomic.AddInt32(&p.blcksig, -1)
+	atomic.AddInt32(&p.waits, -1)
+	pool.Store(p)
+	return RedisResultStream{e: p.Error()}
+}
+
 func (p *pipe) syncDo(dl time.Time, dlOk bool, cmd Completed) (resp RedisResult) {
 	if dlOk {
+		if p.timeout > 0 {
+			defaultDeadline := time.Now().Add(p.timeout)
+			if dl.After(defaultDeadline) {
+				dl = defaultDeadline
+			}
+		}
 		p.conn.SetDeadline(dl)
 	} else if p.timeout > 0 && !cmd.IsBlock() {
 		p.conn.SetDeadline(time.Now().Add(p.timeout))
@@ -958,10 +1165,8 @@ func (p *pipe) syncDo(dl time.Time, dlOk bool, cmd Completed) (resp RedisResult)
 
 	var msg RedisMessage
 	err := writeCmd(p.w, cmd.Commands())
-	if err == nil {
-		if err = p.w.Flush(); err == nil {
-			msg, err = syncRead(p.r)
-		}
+	if err = p.w.Flush(); err == nil {
+		msg, err = syncRead(p.r)
 	}
 	if err != nil {
 		if errors.Is(err, os.ErrDeadlineExceeded) {
@@ -976,10 +1181,17 @@ func (p *pipe) syncDo(dl time.Time, dlOk bool, cmd Completed) (resp RedisResult)
 
 func (p *pipe) syncDoMulti(dl time.Time, dlOk bool, resp []RedisResult, multi []Completed) {
 	if dlOk {
+		if p.timeout > 0 {
+			defaultDeadline := time.Now().Add(p.timeout)
+			if dl.After(defaultDeadline) {
+				dl = defaultDeadline
+			}
+		}
 		p.conn.SetDeadline(dl)
 	} else if p.timeout > 0 {
 		for _, cmd := range multi {
 			if cmd.IsBlock() {
+				p.conn.SetDeadline(time.Time{})
 				goto process
 			}
 		}
@@ -990,7 +1202,6 @@ func (p *pipe) syncDoMulti(dl time.Time, dlOk bool, resp []RedisResult, multi []
 process:
 	var err error
 	var msg RedisMessage
-
 	for _, cmd := range multi {
 		_ = writeCmd(p.w, cmd.Commands())
 	}
@@ -1270,7 +1481,7 @@ func (p *pipe) Close() {
 			p.background()
 		}
 		if block == 1 && (stopping1 || stopping2) { // make sure there is no block cmd
-			<-p.queue.PutOne(cmds.QuitCmd)
+			<-p.queue.PutOne(cmds.PingCmd)
 		}
 	}
 	atomic.AddInt32(&p.waits, -1)
