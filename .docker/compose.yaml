@@ -7,7 +7,7 @@ services:
     restart: always
   postgres:
     container_name: ${APP_NAME}-postgres
-    image: postgres:15.3-alpine
+    image: postgres:15.8-alpine
     ports:
       - ${POSTGRES_PORT}:5432
     environment:
