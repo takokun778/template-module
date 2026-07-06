@@ -5,7 +5,7 @@ go 1.21
 require (
 	github.com/bufbuild/connect-go v1.10.0
 	github.com/go-chi/chi/v5 v5.0.10
-	github.com/go-chi/cors v1.2.1
+	github.com/go-chi/cors v1.2.2
 	github.com/go-chi/httplog v0.3.1
 	github.com/google/uuid v1.3.0
 	github.com/jackc/pgx/v5 v5.4.3
